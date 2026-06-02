@@ -1,0 +1,280 @@
+local player = game:GetService("Players").LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local humanoid = character:WaitForChild("Humanoid")
+local rootPart = character:WaitForChild("HumanoidRootPart")
+local userInputService = game:GetService("UserInputService")
+local runService = game:GetService("RunService")
+local lighting = game:GetService("Lighting")
+local coreGui = game:GetService("CoreGui")
+
+local baseSpeed, baseAccel, baseDecel = 140, 0.4, 1.2
+local currentMaxSpeed, currentAccel, currentDecel = baseSpeed, baseAccel, baseDecel
+local turningSpeed, handbrakeTurnMultiplier, inertiaFriction = 3, 2.5, 0.002
+local isDriving, isSpecialMode, canPop, isHandbraking = false, false, true, false
+local keysPressed = {W = false, A = false, S = false, D = false, F = false}
+local clickCount, currentSpeed, targetRotation = 0, 0, 0
+local targetDistance, stiffness, damping, lastVerticalError = 3.3, 4500, 300, 0
+
+local carBase, bodyVelocity, bodyGyro, bodyForce
+local idleSound, moveSound, brakeSound, driftSound, popSound
+local lightL, lightR, attL, attR, driftSmokeEmitter
+
+local blinkers = {L = false, R = false}
+local blinkerTimer, blinkerState = 0, false
+local lightBlinkL, attBL, lightBlinkR, attBR
+local blinkSound = Instance.new("Sound", rootPart)
+blinkSound.SoundId = "rbxassetid://78108713022711"
+blinkSound.Volume = 1
+
+if coreGui:FindFirstChild("Manual_Pro_Core_System") then
+    coreGui:FindFirstChild("Manual_Pro_Core_System"):Destroy()
+end
+
+local screenGui = Instance.new("ScreenGui", coreGui)
+screenGui.Name = "Manual_Pro_Core_System"
+screenGui.IgnoreGuiInset, screenGui.Enabled = true, false
+
+local mobileFrame = Instance.new("Frame", screenGui)
+mobileFrame.Size, mobileFrame.BackgroundTransparency = UDim2.new(1, 0, 1, 0), 1
+
+local dial = Instance.new("TextButton", screenGui)
+dial.Size, dial.Position = UDim2.new(0.15, 0, 0.08, 0), UDim2.new(0.425, 0, 0.05, 0)
+dial.BackgroundColor3, dial.BackgroundTransparency, dial.Text = Color3.fromRGB(0, 0, 0), 0.4, ""
+Instance.new("UICorner", dial)
+local glow = Instance.new("UIStroke", dial)
+glow.Thickness, glow.Color = 3, Color3.fromRGB(0, 255, 255)
+
+local speedText = Instance.new("TextLabel", dial)
+speedText.Size, speedText.BackgroundTransparency = UDim2.new(1, 0, 1, 0), 1
+speedText.TextColor3, speedText.Font, speedText.TextScaled, speedText.Text = Color3.new(1, 1, 1), Enum.Font.Code, true, "0"
+
+local function createBlinkerLight(side)
+    local pName = (humanoid.RigType == Enum.HumanoidRigType.R15) and (side == "L" and "LeftUpperLeg" or "RightUpperLeg") or (side == "L" and "Left Leg" or "Right Leg")
+    local part = character:FindFirstChild(pName) or rootPart
+    local att = Instance.new("Attachment", part)
+    local l = Instance.new("PointLight", att)
+    l.Color, l.Range, l.Brightness, l.Enabled = Color3.fromRGB(255, 130, 0), 10, 6, false
+    return l, att
+end
+
+local function createBlinkerBtn(name, pos, text, side)
+    local btn = Instance.new("TextButton", mobileFrame)
+    btn.Size, btn.Position = UDim2.new(0.07, 0, 0.08, 0), pos
+    btn.BackgroundColor3, btn.BackgroundTransparency = Color3.fromRGB(15, 15, 15), 0.4
+    btn.Text, btn.TextColor3, btn.TextScaled = text, Color3.new(1, 1, 1), true
+    Instance.new("UICorner", btn)
+    local stroke = Instance.new("UIStroke", btn)
+    stroke.Thickness, stroke.Color = 2, Color3.fromRGB(200, 200, 200)
+    btn.Activated:Connect(function()
+        blinkers[side] = not blinkers[side]
+        blinkers[(side == "L") and "R" or "L"] = false
+    end)
+    return btn, stroke
+end
+
+local btnBlinkerL, strokeBlinkerL = createBlinkerBtn("BlinkerL", UDim2.new(0.75, 0, 0.05, 0), "⬅", "L")
+local btnBlinkerR, strokeBlinkerR = createBlinkerBtn("BlinkerR", UDim2.new(0.83, 0, 0.05, 0), "➡", "R")
+
+local function createBtn(name, pos, size, text, color, key)
+    local btn = Instance.new("TextButton", mobileFrame)
+    btn.Name, btn.Size, btn.Position = name, size, pos
+    btn.BackgroundColor3, btn.BackgroundTransparency = Color3.fromRGB(20, 20, 20), 0.4
+    btn.Text, btn.TextColor3, btn.TextScaled = text, Color3.new(1, 1, 1), true
+    Instance.new("UICorner", btn)
+    local stroke = Instance.new("UIStroke", btn)
+    stroke.Thickness, stroke.Color = 2, color
+    btn.MouseButton1Down:Connect(function() keysPressed[key] = true end)
+    btn.MouseButton1Up:Connect(function()
+        keysPressed[key] = false
+        if key == "W" and currentSpeed > 50 and isSpecialMode and canPop then
+            canPop = false
+            for i = 1, 3 do
+                local p = Instance.new("Sound", rootPart)
+                p.SoundId, p.Volume, p.PlayOnRemove = "rbxassetid://140562715692021", 2, true
+                p:Destroy()
+                task.wait(math.random(10, 30) / 100)
+            end
+            task.wait(0.5)
+            canPop = true
+        end
+    end)
+    btn.MouseLeave:Connect(function() keysPressed[key] = false end)
+    return btn
+end
+
+createBtn("BtnA", UDim2.new(0.05, 0, 0.72, 0), UDim2.new(0.09, 0, 0.13, 0), "◀", Color3.fromRGB(0, 150, 255), "A")
+createBtn("BtnD", UDim2.new(0.15, 0, 0.72, 0), UDim2.new(0.09, 0, 0.13, 0), "▶", Color3.fromRGB(0, 150, 255), "D")
+createBtn("BtnS", UDim2.new(0.72, 0, 0.82, 0), UDim2.new(0.09, 0, 0.13, 0), "▼", Color3.fromRGB(255, 50, 50), "S")
+createBtn("BtnW", UDim2.new(0.85, 0, 0.68, 0), UDim2.new(0.09, 0, 0.13, 0), "▲", Color3.fromRGB(0, 255, 100), "W")
+createBtn("BtnHB", UDim2.new(0.72, 0, 0.68, 0), UDim2.new(0.09, 0, 0.13, 0), "( ! )", Color3.fromRGB(255, 150, 0), "F")
+
+dial.Activated:Connect(function()
+    clickCount = clickCount + 1
+    if clickCount >= 3 then
+        clickCount, isSpecialMode = 0, not isSpecialMode
+        if isSpecialMode then
+            glow.Color, currentMaxSpeed, currentAccel, currentDecel = Color3.fromRGB(255, 120, 0), 250, 0.9, 1.5
+        else
+            glow.Color, currentMaxSpeed, currentAccel, currentDecel = Color3.fromRGB(0, 255, 255), baseSpeed, baseAccel, baseDecel
+        end
+    end
+end)
+
+local function createDriftSmoke()
+    local emitter = Instance.new("ParticleEmitter")
+    emitter.Texture = "rbxasset://textures/particles/smoke_main.dds"
+    emitter.Color = ColorSequence.new(Color3.new(1, 1, 1))
+    emitter.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.2), NumberSequenceKeypoint.new(1, 1)})
+    emitter.Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.4), NumberSequenceKeypoint.new(1, 1.2)})
+    emitter.Lifetime, emitter.Speed, emitter.Rate = NumberRange.new(0.1, 0.2), NumberRange.new(35, 55), 0
+    emitter.EmissionDirection, emitter.SpreadAngle = Enum.NormalId.Back, Vector2.new(3, 3)
+    emitter.Parent = character:FindFirstChild("LowerTorso") or character:FindFirstChild("Torso") or rootPart
+    return emitter
+end
+
+local function createLights()
+    local function makeL(side)
+        local att = Instance.new("Attachment", rootPart); att.Position = Vector3.new(side, 0, -1.5)
+        local l = Instance.new("SpotLight", att); l.Range, l.Brightness, l.Enabled = 60, 3, false
+        return l, att
+    end
+    lightL, attL = makeL(-1.2)
+    lightR, attR = makeL(1.2)
+end
+
+local mainGui = Instance.new("ScreenGui", player.PlayerGui)
+local toggleBtn = Instance.new("TextButton", mainGui)
+toggleBtn.Size, toggleBtn.Position = UDim2.new(0, 180, 0, 50), UDim2.new(0.5, -90, 0.85, 0)
+toggleBtn.BackgroundColor3, toggleBtn.Text = Color3.fromRGB(0, 180, 100), "START DRIVING"
+Instance.new("UICorner", toggleBtn)
+
+userInputService.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    local k = input.KeyCode
+     if k == Enum.KeyCode.V then
+        toggleBtn:Activate()
+        return
+    end
+    if k == Enum.KeyCode.W then keysPressed.W = true
+    elseif k == Enum.KeyCode.S then keysPressed.S = true
+    elseif k == Enum.KeyCode.A then keysPressed.A = true
+    elseif k == Enum.KeyCode.D then keysPressed.D = true
+    elseif k == Enum.KeyCode.F then keysPressed.F = true
+    elseif k == Enum.KeyCode.Left then blinkers.L = not blinkers.L; blinkers.R = false
+    elseif k == Enum.KeyCode.Right then blinkers.R = not blinkers.R; blinkers.L = false end
+end)
+
+userInputService.InputEnded:Connect(function(input)
+    local k = input.KeyCode
+    if k == Enum.KeyCode.W then keysPressed.W = false
+    elseif k == Enum.KeyCode.S then keysPressed.S = false
+    elseif k == Enum.KeyCode.A then keysPressed.A = false
+    elseif k == Enum.KeyCode.D then keysPressed.D = false
+    elseif k == Enum.KeyCode.F then keysPressed.F = false end
+end)
+
+toggleBtn.Activated:Connect(function()
+    isDriving = not isDriving
+    if isDriving then
+        carBase = Instance.new("Part", workspace); carBase.Name, carBase.Size, carBase.Transparency, carBase.CanCollide = "CarBase", Vector3.new(4, 1, 4), 1, false
+        idleSound = Instance.new("Sound", rootPart); idleSound.SoundId, idleSound.Looped = "rbxassetid://125640110248126", true; idleSound:Play()
+        moveSound = Instance.new("Sound", rootPart); moveSound.SoundId, moveSound.Looped, moveSound.Volume = "rbxassetid://15097728824", true, 0; moveSound:Play()
+        brakeSound = Instance.new("Sound", rootPart); brakeSound.SoundId, brakeSound.Looped, brakeSound.Volume = "rbxassetid://249755575", false, 0
+        driftSound = Instance.new("Sound", rootPart); driftSound.SoundId, driftSound.Looped, driftSound.Volume = "rbxassetid://3467612565", true, 0; driftSound:Play()
+        bodyVelocity = Instance.new("BodyVelocity", carBase); bodyVelocity.MaxForce = Vector3.new(1e5, 0, 1e5)
+        bodyGyro = Instance.new("BodyGyro", carBase); bodyGyro.MaxTorque, bodyGyro.P = Vector3.new(1e5, 1e5, 1e5), 20000
+        bodyForce = Instance.new("BodyForce", carBase)
+        local weld = Instance.new("Weld", carBase); weld.Part0, weld.Part1 = carBase, rootPart
+        targetRotation = select(2, rootPart.CFrame:ToEulerAnglesYXZ())
+        createLights()
+        driftSmokeEmitter = createDriftSmoke()
+        lightBlinkL, attBL = createBlinkerLight("L")
+        lightBlinkR, attBR = createBlinkerLight("R")
+        humanoid.WalkSpeed, humanoid.Sit, screenGui.Enabled = 0, true, true
+        toggleBtn.Text, toggleBtn.BackgroundColor3 = "STOP DRIVING", Color3.fromRGB(200, 50, 50)
+    else
+        if carBase then carBase:Destroy() end
+        if idleSound then idleSound:Destroy() end; if moveSound then moveSound:Destroy() end; if brakeSound then brakeSound:Destroy() end; if driftSound then driftSound:Destroy() end
+        if attL then attL:Destroy() end; if attR then attR:Destroy() end; if attBL then attBL:Destroy() end; if attBR then attBR:Destroy() end
+        if driftSmokeEmitter then driftSmokeEmitter:Destroy() end
+        humanoid.Sit, humanoid.WalkSpeed, currentSpeed, screenGui.Enabled = false, 16, 0, false
+        toggleBtn.Text, toggleBtn.BackgroundColor3 = "START DRIVING", Color3.fromRGB(0, 180, 100)
+        blinkers.L, blinkers.R = false, false
+    end
+end)
+
+runService.Heartbeat:Connect(function(dt)
+    mobileFrame.Visible = not userInputService.KeyboardEnabled
+    if not isDriving or not carBase then return end  
+
+    blinkerTimer = blinkerTimer + dt  
+    if blinkerTimer >= 0.45 then  
+        blinkerTimer, blinkerState = 0, not blinkerState  
+        if (blinkers.L or blinkers.R) and blinkerState then blinkSound:Play() end  
+    end  
+
+    lightBlinkL.Enabled = blinkers.L and blinkerState  
+    strokeBlinkerL.Color = (blinkers.L and blinkerState) and Color3.fromRGB(255, 130, 0) or Color3.fromRGB(200, 200, 200)  
+    btnBlinkerL.TextColor3 = (blinkers.L and blinkerState) and Color3.fromRGB(255, 130, 0) or Color3.new(1, 1, 1)  
+
+    lightBlinkR.Enabled = blinkers.R and blinkerState  
+    strokeBlinkerR.Color = (blinkers.R and blinkerState) and Color3.fromRGB(255, 130, 0) or Color3.fromRGB(200, 200, 200)  
+    btnBlinkerR.TextColor3 = (blinkers.R and blinkerState) and Color3.fromRGB(255, 130, 0) or Color3.new(1, 1, 1)  
+
+    local absSpeed = math.abs(currentSpeed)  
+    local isNight = lighting.ClockTime >= 18 or lighting.ClockTime <= 6  
+    if lightL and lightR then lightL.Enabled, lightR.Enabled = isNight, isNight end  
+
+    isHandbraking = keysPressed.F    
+    local rp = RaycastParams.new()    
+    rp.FilterDescendantsInstances, rp.FilterType, rp.RespectCanCollide = {character, carBase}, Enum.RaycastFilterType.Exclude, true   
+
+    if workspace:Raycast(rootPart.Position, rootPart.CFrame.LookVector * 2.5, rp) and absSpeed > 2 then currentSpeed = 0 end    
+
+    local gPush = rootPart.CFrame.LookVector.Y * 1.5  
+    if keysPressed.W and not isHandbraking then     
+        currentSpeed = math.min(currentSpeed + currentAccel - gPush, currentMaxSpeed)    
+    elseif keysPressed.S and not isHandbraking then     
+        if currentSpeed > 0 then  
+            currentSpeed = math.max(currentSpeed - (currentDecel * math.clamp(1.5 - (absSpeed / currentMaxSpeed), 0.4, 1.2)) - gPush, 0)    
+        else  
+            currentSpeed = math.max(currentSpeed - currentAccel - gPush, -currentMaxSpeed)  
+        end  
+    elseif isHandbraking then    
+        currentSpeed = (currentSpeed - gPush) * ((absSpeed < 30) and 0.96 or 0.995)     
+    else    
+        currentSpeed = (currentSpeed - gPush) * (1 - inertiaFriction)     
+    end    
+  
+    local turnStr = isHandbraking and (turningSpeed * handbrakeTurnMultiplier) or turningSpeed    
+    local dynTurn = (absSpeed > 0.1) and math.max(0.9, turnStr / (1 + (absSpeed / 100))) or 0    
+
+    if keysPressed.A then targetRotation = targetRotation + dynTurn * dt end    
+    if keysPressed.D then targetRotation = targetRotation - dynTurn * dt end    
+  
+    local isDrifting = isHandbraking and absSpeed > 20 and (keysPressed.A or keysPressed.D)    
+    if driftSmokeEmitter then driftSmokeEmitter.Rate = isDrifting and 180 or 0 end    
+    if driftSound then driftSound.Volume = isDrifting and 0.8 or 0 end    
+
+    idleSound.Volume = absSpeed < 1 and 1 or 0    
+    if absSpeed >= 1 then    
+        moveSound.Volume, moveSound.PlaybackSpeed = 1, 1 + (absSpeed / currentMaxSpeed) * 1.5     
+    else    
+        moveSound.Volume = 0    
+    end    
+  
+    local ground = workspace:Raycast(rootPart.Position, Vector3.new(0, -10, 0), rp)    
+    if ground then    
+        local comp = targetDistance - (rootPart.Position - ground.Position).Magnitude    
+        local vel = (comp - lastVerticalError) / dt    
+        lastVerticalError = comp    
+        bodyForce.Force = Vector3.new(0, math.max(0, (comp * stiffness) + (vel * damping)), 0)    
+        local normal, right = ground.Normal, rootPart.CFrame.RightVector    
+        bodyGyro.CFrame = CFrame.fromMatrix(rootPart.Position, right, normal, -right:Cross(normal)) * CFrame.Angles(0, targetRotation - select(2, rootPart.CFrame:ToEulerAnglesYXZ()), 0)    
+    else     
+        bodyForce.Force, lastVerticalError, bodyGyro.CFrame = Vector3.new(0, 0, 0), 0, CFrame.Angles(0, targetRotation, 0)    
+    end    
+  
+    bodyVelocity.Velocity = bodyVelocity.Velocity:Lerp(rootPart.CFrame.LookVector * currentSpeed, isHandbraking and 0.025 or 0.15)     
+    speedText.Text = tostring(math.floor(absSpeed))
+end)
